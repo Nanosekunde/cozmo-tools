@@ -31,9 +31,12 @@ class CV_Contour(StateMachineProgram):
         thresh1 = cv2.getTrackbarPos('thresh1','contour')
         ret, thresholded = cv2.threshold(gray, thresh1, 255, 0)
         cv2.imshow('contour',thresholded)
-        stuff, contours, hierarchy = \
-            cv2.findContours(thresholded, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-
+        if cv2.__version__[0] >= '4':
+            contours, hierarchy = \
+                cv2.findContours(thresholded, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        else:  # in OpenCV 3.x there was an additional return value
+            dummy, contours, hierarchy = \
+                cv2.findContours(thresholded, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         areas = [(i, cv2.contourArea(contours[i])) for i in range(len(contours))]
         areas.sort(key=lambda x: x[1])
         areas.reverse()
@@ -41,8 +44,9 @@ class CV_Contour(StateMachineProgram):
         self.contours = contours
         self.hierarchy = hierarchy
 
-    def user_annotate(self,image):
+    def user_annotate(self,annotated_image):
         minArea = cv2.getTrackbarPos('minArea','contour')
+        scale = self.annotated_scale_factor
         for area_entry in self.areas:
             if area_entry[1] < minArea:
                 break
@@ -51,6 +55,6 @@ class CV_Contour(StateMachineProgram):
             while temp != -1 and depth < len(self.colors)-1:
                 depth += 1
                 temp = self.hierarchy[0,temp,3]
-            contour = 2 * self.contours[index]
-            cv2.drawContours(image, [contour], 0, self.colors[depth], 1)
-        return image
+            contour = scale * self.contours[index]
+            cv2.drawContours(annotated_image, [contour], 0, self.colors[depth], 1)
+        return annotated_image

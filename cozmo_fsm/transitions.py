@@ -30,7 +30,9 @@ class CSFEventBase(Transition):
             self.robot.erouter.add_listener(self, self.event_type, source)
 
     def handle_event(self,event):
-        if not self.running: return
+        if not self.running:
+            print('***',self,'got an event ', event, ' while not running!')
+            return
         if TRACE.trace_level >= TRACE.listener_invocation:
             print('TRACE%d: %s is handling %s' %
                   (TRACE.listener_invocation, self,event))
@@ -69,7 +71,7 @@ class CNextTrans(CSFEventBase):
 class NextTrans(Transition):
     """Transition sends a NextEvent to its target nodes to advance an iterator."""
     def start(self, event=None):
-        super().start(event)
+        super().start()
         self.fire(Iterate.NextEvent())
 
 
@@ -124,6 +126,33 @@ class TapTrans(Transition):
         else:
             self.handle = \
                 self.robot.loop.call_later(Transition.default_value_delay, self.fire, event)
+
+
+class ObservedMotionTrans(Transition):
+    """Transition fires when motion is observed in the camera image."""
+    def start(self):
+        if self.running: return
+        super().start()
+        self.robot.erouter.add_listener(self,ObservedMotionEvent,None)
+
+    def handle_event(self,event):
+        if not self.running: return
+        super().handle_event(event)
+        self.fire(event)
+
+
+class UnexpectedMovementTrans(Transition):
+    """Transition fires when unexpected movement is detected."""
+    def start(self):
+        if self.running: return
+        super().start()
+        self.robot.erouter.add_listener(self,UnexpectedMovementEvent,None)
+
+    def handle_event(self,event):
+        if not self.running: return
+        super().handle_event(event)
+        self.fire(event)
+
 
 class DataTrans(Transition):
     """Transition fires when data matches."""

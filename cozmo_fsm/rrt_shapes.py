@@ -23,6 +23,10 @@ class Shape():
         else:
             raise Exception("%s has no collides() method defined for %s." % (self, shape))
 
+    def get_bounding_box(self):
+        """Should return ((xmin,ymin), (xmax,ymax))"""
+        raise NotImplementedError("get_bounding_box")
+
 #================ Basic Shapes ================
 
 class Circle(Shape):
@@ -33,8 +37,9 @@ class Circle(Shape):
         self.orient = 0.
 
     def __repr__(self):
-        return '<Circle (%.1f,%.1f) r=%.1f>' % \
-               (self.center[0,0], self.center[1,0], self.radius)
+        id = self.obstacle.id if self.obstacle else '[no obstacle]'
+        return '<Circle (%.1f,%.1f) r=%.1f %s>' % \
+               (self.center[0,0], self.center[1,0], self.radius, id)
 
     def instantiate(self, tmat):
         return Circle(center=tmat.dot(self.center), radius=self.radius)        
@@ -51,24 +56,44 @@ class Circle(Shape):
         dist = sqrt(dx*dx + dy*dy)
         return dist < (self.radius + circle.radius)
         
+    def get_bounding_box(self):
+        xmin = self.center[0,0] - self.radius
+        xmax = self.center[0,0] + self.radius
+        ymin = self.center[1,0] - self.radius
+        ymax = self.center[1,0] + self.radius
+        return ((xmin,ymin), (xmax,ymax))
+
 class Polygon(Shape):
     def __init__(self, vertices=None):
-      self.vertices = vertices
-      N = vertices.shape[1]
-      self.edges = tuple( (vertices[:,i:i+1], vertices[:,(i+1)%N:((i+1)%N)+1])
-                          for i in range(N) )
-      center = vertices.mean(1).resize(4,1)
+        self.vertices = vertices
+        N = vertices.shape[1]
+        self.edges = tuple( (vertices[:,i:i+1], vertices[:,(i+1)%N:((i+1)%N)+1])
+                            for i in range(N) )
+        center = vertices.mean(1).resize(4,1)
 
-    def collides_poly(poly): pass
+    def get_bounding_box(self):
+        mins = self.vertices.min(1)
+        maxs = self.vertices.max(1)
+        xmin = mins[0]
+        ymin = mins[1]
+        xmax = maxs[0]
+        ymax = maxs[1]
+        return ((xmin,ymin), (xmax,ymax))
 
-    def collides_circle(circle):
-        raise ValueError()
+    def collides_poly(self,poly):
+        raise NotImplementedError()
+
+    def collides_circle(self,circle):
+        raise NotImplementedError()
+
 
 class Rectangle(Polygon):
     def __init__(self, center=None, dimensions=None, orient=0):
         self.center = center
         self.dimensions = dimensions
         self.orient = orient
+        if not isinstance(dimensions[0],(float,int)):
+            raise ValueError(dimensions)
         dx2 = dimensions[0]/2
         dy2 = dimensions[1]/2
         vertices = np.array([[-dx2,  dx2, dx2, -dx2 ],
@@ -77,20 +102,21 @@ class Rectangle(Polygon):
                              [  1,    1,   1,    1  ]])
         self.unrot = transform.aboutZ(-orient)
         center_ex = self.unrot.dot(center)
-        extents = transform.translate(center_ex[0],center_ex[1]).dot(vertices)
+        extents = transform.translate(center_ex[0,0],center_ex[1,0]).dot(vertices)
         # Extents measured along the rectangle's axes, not world axes
         self.min_Ex = min(extents[0,:])
         self.max_Ex = max(extents[0,:])
         self.min_Ey = min(extents[1,:])
         self.max_Ey = max(extents[1,:])
-        vertices = transform.aboutZ(orient).dot(vertices)
-        vertices = transform.translate(center[0],center[1]).dot(vertices)
-        super().__init__(vertices=vertices)
+        world_vertices = transform.aboutZ(orient).dot(vertices)
+        world_vertices = transform.translate(center[0,0],center[1,0]).dot(world_vertices)
+        super().__init__(vertices=world_vertices)
 
     def __repr__(self):
-        return '<Rectangle (%.1f,%.1f) %.1fx%.1f %.1f deg>' % \
+        id = self.obstacle.id if self.obstacle else '[no obstacle]'
+        return '<Rectangle (%.1f,%.1f) %.1fx%.1f %.1f deg %s>' % \
                (self.center[0,0],self.center[1,0],*self.dimensions,
-                self.orient*(180/pi))
+                self.orient*(180/pi), id)
 
     def instantiate(self, tmat):
         dimensions = (self.max_Ex-self.min_Ex, self.max_Ey-self.min_Ey)

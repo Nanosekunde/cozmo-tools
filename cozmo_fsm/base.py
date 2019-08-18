@@ -15,7 +15,7 @@ class StateNode(EventListener):
     """Base class for state nodes; does nothing."""
     def __init__(self):
         super().__init__()
-        self.parent = None
+        self.parent = b'No parent defined yet.'
         self.children = {}
         self.transitions = []
         self.start_node = None
@@ -81,7 +81,7 @@ class StateNode(EventListener):
         if not isinstance(parent, StateNode):
             raise TypeError('%s is not a StateNode' % parent)
         try:
-            if self.parent:
+            if isinstance(self.parent, StateNode):
                 raise Exception('parent already set')
         except AttributeError:
             raise Exception("It appears %s's __init__ method did not call super().__init__"
@@ -129,6 +129,9 @@ class StateNode(EventListener):
         """Use now() to execute this node from the command line instead of as part of a state machine."""
         if not self.robot:
             raise ValueError('Node %s has no robot designated.' % self)
+        # 'program' is inserted into this module by __init__ to avoid circular importing
+        program.running_fsm.children = dict()
+        program.running_fsm.children[self.name] = self
         self.robot.loop.call_soon(self.start)
         return self
 
@@ -187,7 +190,7 @@ class Transition(EventListener):
                 if src.running:
                     if TRACE.trace_level >= TRACE.transition_startstop:
                         print('TRACE%d:' % TRACE.transition_startstop,self,'saved from stopping by',src)
-                        return
+                    return
             if TRACE.trace_level >= TRACE.transition_startstop:
                 print('TRACE%d:' % TRACE.transition_startstop, self, 'stopping')
             super().stop()

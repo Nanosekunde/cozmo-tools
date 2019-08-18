@@ -6,6 +6,7 @@ from math import sin, cos, atan2, pi, radians
 import time
 import array
 import numpy as np
+import platform as pf
 
 try:
     from OpenGL.GLUT import *
@@ -22,6 +23,8 @@ import cozmo
 from cozmo.nav_memory_map import NodeContentTypes
 
 WINDOW = None
+EXCEPTION_COUNTER = 0
+DISPLAY_ENABLED = True
 
 help_text = """
 World viewer keyboard commands:
@@ -43,7 +46,32 @@ World viewer keyboard commands:
   x            Toggle axes
   z            Reset to initial view
   v            Toggle display of viewing parameters
+  #            Disable/enable automatic redisplay
   h            Print help
+"""
+
+help_text_mac = """
+World viewer keyboard commands:
+  option + a       Translate gazepoint left
+  option + d       Translate gazepoint right
+  option + w       Translate gazepoint forward
+  option + s       Translate gazepoint backward
+  option + <       Zoom in
+  option + >       Zoom out
+  fn + up-arrow    Translate gazepoint up
+  fn + down-arrow  Translate gazepoint down
+
+  left-arrow       Orbit camera left
+  right-arrow      Orbit camera right
+  up-arrow         Orbit camera upward
+  down-arrow       Orbit camera downward
+
+  option + m       Toggle memory map
+  option + x       Toggle axes
+  option + z       Reset to initial view
+  option + v       Toggle display of viewing parameters
+  #                Disable/enable automatic redisplay
+  option + h       Print help
 """
 
 cube_vertices = array.array('f', [ \
@@ -98,7 +126,7 @@ color_green  = (0., 1., 0.)
 color_light_green  = (0., 0.5, 0.)
 color_blue   = (0., 0., 1.0)
 color_cyan   = (0., 1.0, 1.0)
-color_yellow = (1., .93, 0.)
+color_yellow = (0.8, 0.8, 0.)
 color_orange = (1., 0.5, .063)
 color_gray =   (0.5, 0.5, 0.5)
 color_light_gray =   (0.65, 0.65, 0.65)
@@ -156,7 +184,7 @@ class WorldMapViewer():
         self.show_axes = True
         self.show_memory_map = False
 
-    def make_cube(self, size=(1,1,1), highlight=False, color=None, body=True, edges=True):
+    def make_cube(self, size=(1,1,1), highlight=False, color=None, alpha=1.0, body=True, edges=True):
         """Make a cube centered on the origin"""
         glEnableClientState(GL_VERTEX_ARRAY)
         if color is None:
@@ -167,9 +195,9 @@ class WorldMapViewer():
                 glColorPointer(3, GL_FLOAT, 0, cube_colors_0.tobytes())
         else:
             if not highlight:
-                s = 0.5   # scale down the brightness if necessary
+                s = 0.5   # scale down the brightness
                 color = (color[0]*s, color[1]*s, color[2]*s)
-            glColor4f(*color,1)
+            glColor4f(*color,alpha)
         verts = cube_vertices * 1; # copy the array
         for i in range(0,24,3):
             verts[i  ] *= size[0]
@@ -201,31 +229,36 @@ class WorldMapViewer():
         glDisableClientState(GL_COLOR_ARRAY)
         glDisableClientState(GL_VERTEX_ARRAY)
 
-    def make_light_cube(self,lcube,cube_obst):
+    def make_light_cube(self,cube_obj):
         global gl_lists
-        cube_number = cube_obst.id
-        pos = (cube_obst.x, cube_obst.y, cube_obst.z)
+        lcube = cube_obj.sdk_obj
+        cube_number = lcube.cube_id
+        pos = (cube_obj.x, cube_obj.y, cube_obj.z)
         color = (None, color_red, color_green, color_blue)[cube_number]
-        valid_pose = (lcube.pose.origin_id == self.robot.pose.origin_id)
+        valid_pose = (lcube.pose.is_valid and cube_obj.pose_confidence >= 0) or \
+                     self.robot.carrying is cube_obj
         c = glGenLists(1)
         glNewList(c, GL_COMPILE)
         glPushMatrix()
         glTranslatef(*pos)
-        # Transpose the matrix for sending to OpenCV
-        t = transform.quat2rot(*lcube.pose.rotation.q0_q1_q2_q3).transpose()
+        if lcube.is_visible:
+            t = transform.quat2rot(*lcube.pose.rotation.q0_q1_q2_q3)
+        else:
+            t = transform.aboutZ(cube_obj.theta)
+        t = t.transpose()   # Transpose the matrix for sending to OpenGL
         rotmat = array.array('f',t.flatten()).tobytes()
         glMultMatrixf(rotmat)
         s = light_cube_size_mm
-        if lcube.pose.is_comparable(self.robot.pose):
+        if valid_pose:
             # make solid cube and highlight if visible
             self.make_cube((s,s,s), highlight=lcube.is_visible, color=color)
+            glRotatef(-90, 0., 0., 1.)
+            glTranslatef(-s/4, -s/4, s/2+0.5)
+            glScalef(0.25, 0.2, 0.25)
+            glutStrokeCharacter(GLUT_STROKE_MONO_ROMAN, ord(ascii(cube_number)))
         else:
             # make wireframe cube if coords no longer comparable
-            self.make_cube((s,s,s), body=False, highlight=True, color=color)
-        glRotatef(-90, 0., 0., 1.)
-        glTranslatef(-s/4, -s/4, s/2+0.5)
-        glScalef(0.25, 0.2, 0.25)
-        glutStrokeCharacter(GLUT_STROKE_MONO_ROMAN, ord(ascii(cube_number)))
+            pass # self.make_cube((s,s,s), body=False, highlight=True, color=color)
         glPopMatrix()
         glEndList()
         gl_lists.append(c)
@@ -293,7 +326,7 @@ class WorldMapViewer():
             theta = i * (360/num_slices) * (pi/180)
             glVertex3f(r * cos(theta), r*sin(theta), 0.)
         glEnd()
-            
+
 
     def make_chip(self,chip):
         global gl_lists
@@ -313,7 +346,11 @@ class WorldMapViewer():
         glNewList(c, GL_COMPILE)
         glPushMatrix()
         glTranslatef(face.x, face.y, face.z)
-        glColor4f(0., 1., 0., 0.9)
+        if face.is_visible:
+            color = (0.0, 1.0, 0.0, 0.9)
+        else:
+            color = (0.0, 0.5, 0.0, 0.7)
+        glColor4f(*color)
         quadric = gluNewQuadric()
         gluQuadricOrientation(quadric, GLU_OUTSIDE)
         glScalef(1.0, 1.0, 2.0)
@@ -323,12 +360,13 @@ class WorldMapViewer():
         gl_lists.append(c)
 
 
-    def make_wall(self,wall_obst):
+    def make_wall(self,wall_obj):
         global gl_lists
-        wall_spec = worldmap.wall_marker_dict[wall_obst.id]
-        half_length = wall_obst.length / 2
-        half_height = wall_obst.height / 2
-        door_height = wall_obst.door_height
+        wall_spec = worldmap.wall_marker_dict[wall_obj.id]
+        half_length = wall_obj.length / 2
+        half_height = wall_obj.height / 2
+        door_height = wall_obj.door_height
+        wall_thickness = 4.0
         widths = []
         last_x = -half_length
         edges = [ [0, -half_length, door_height/2, 1.] ]
@@ -342,30 +380,45 @@ class WorldMapViewer():
         edges.append([0., half_length, door_height/2, 1.])
         widths.append(half_length-last_x)
         edges = np.array(edges).T
-        edges = transform.aboutZ(wall_obst.theta).dot(edges)
-        edges = transform.translate(wall_obst.x,wall_obst.y).dot(edges)
+        edges = transform.aboutZ(wall_obj.theta).dot(edges)
+        edges = transform.translate(wall_obj.x,wall_obj.y).dot(edges)
         c = glGenLists(1)
         glNewList(c, GL_COMPILE)
-        if wall_obst.foreign:
+        if wall_obj.is_foreign:
             color = color_white
         else:
-            color = color_red
+            color = color_yellow
         for i in range(0,len(widths)):
             center = edges[:, 2*i : 2*i+2].mean(1).reshape(4,1)
-            dimensions=(4.0, widths[i], wall_obst.door_height)
+            dimensions=(wall_thickness, widths[i], wall_obj.door_height)
             glPushMatrix()
             glTranslatef(*center.flatten()[0:3])
-            glRotatef(wall_obst.theta*180/pi, 0, 0, 1)
-            self.make_cube(size=dimensions, color=color)
+            glRotatef(wall_obj.theta*180/pi, 0, 0, 1)
+            self.make_cube(size=dimensions, color=color, highlight=True)
             glPopMatrix()
         # Make the transom
         glPushMatrix()
-        transom_height = wall_obst.height - wall_obst.door_height
-        z = wall_obst.door_height + transom_height/2
-        glTranslatef(wall_obst.x, wall_obst.y, z)
-        glRotatef(wall_obst.theta*180/pi, 0, 0, 1)
-        self.make_cube(size=(4.0, wall_obst.length, transom_height),
-                       edges=False, color=color)
+        transom_height = wall_obj.height - wall_obj.door_height
+        z = wall_obj.door_height + transom_height/2
+        glTranslatef(wall_obj.x, wall_obj.y, z)
+        glRotatef(wall_obj.theta*180/pi, 0, 0, 1)
+        self.make_cube(size=(wall_thickness, wall_obj.length, transom_height),
+                       edges=False, color=color, highlight=True)
+        glPopMatrix()
+        glEndList()
+        gl_lists.append(c)
+
+    def make_doorway(self,doorway):
+        global gl_lists
+        wall = doorway.wall
+        spec = wall.doorways[doorway.index]
+        c = glGenLists(1)
+        glNewList(c, GL_COMPILE)
+        glPushMatrix()
+        glTranslatef(doorway.x, doorway.y, wall.door_height/2)
+        glRotatef(doorway.theta*180/pi, 0, 0, 1)
+        self.make_cube(size=(1, spec[1]-10, wall.door_height-10), edges=False,
+                       color=color_cyan, alpha=0.2, highlight=True)
         glPopMatrix()
         glEndList()
         gl_lists.append(c)
@@ -429,29 +482,37 @@ class WorldMapViewer():
         glEndList()
         gl_lists.append(c)
 
-    def make_marker(self,marker):
+    def make_custom_marker(self,marker):
+        self.make_aruco_marker(marker)
+
+    def make_aruco_marker(self,marker):
         global gl_lists
-        marker_number = marker.id
+        marker_number = marker.marker_number
         s = light_cube_size_mm
-        pos = (marker.x, marker.y, s)
+        pos = (marker.x, marker.y, marker.z)
         color = (color_red, color_green, color_blue)[marker_number%3]
         c = glGenLists(1)
         glNewList(c, GL_COMPILE)
         glPushMatrix()
         glTranslatef(*pos)
-        self.make_cube((1,s,s), color=color)
+        glRotatef(marker.theta*180/pi+180, 0., 0., 1.)
+        highlight = marker.is_visible
+        marker_thickness = 5 # must be thicker than wall
+        self.make_cube((marker_thickness,s,s), color=color, highlight=highlight)
         glRotatef(-90, 0., 0., 1.)
-        glTranslatef(-s/4, -s/4, s/2+0.5)
+        glRotatef(90, 1., 0., 0.)
+        length = len(ascii(marker_number)) + 0.5
+        glTranslatef(-s/4*length, -s/4, marker_thickness)
         glScalef(0.25, 0.2, 0.25)
-        glutStrokeCharacter(GLUT_STROKE_MONO_ROMAN, ord(ascii(marker_number%9)))
+        glutStrokeString(GLUT_STROKE_MONO_ROMAN, c_char_p(bytes(ascii(marker_number),'utf8')))
         glPopMatrix()
         glEndList()
         gl_lists.append(c)
 
-    def make_foreign_cube(self,cube_obst):
+    def make_foreign_cube(self,cube_obj):
         global gl_lists
-        cube_number = cube_obst.id
-        pos = (cube_obst.x, cube_obst.y, cube_obst.z)
+        cube_number = cube_obj.id
+        pos = (cube_obj.x, cube_obj.y, cube_obj.z)
         color = color_white
         c = glGenLists(1)
         glNewList(c, GL_COMPILE)
@@ -714,11 +775,13 @@ class WorldMapViewer():
             items = tuple(self.robot.world.world_map.objects.items())
         for (key,obj) in items:
             if isinstance(obj, worldmap.LightCubeObj):
-                self.make_light_cube(key,obj)
+                self.make_light_cube(obj)
             elif isinstance(obj, worldmap.CustomCubeObj):
                 self.make_custom_cube(key,obj)
             elif isinstance(obj, worldmap.WallObj):
                 self.make_wall(obj)
+            elif isinstance(obj, worldmap.DoorwayObj):
+                pass  # doorways must come last, due to transparency
             elif isinstance(obj, worldmap.ChipObj):
                 self.make_chip(obj)
             elif isinstance(obj, worldmap.FaceObj):
@@ -729,8 +792,14 @@ class WorldMapViewer():
                 self.make_foreign_robot(obj)
             elif isinstance(obj, worldmap.LightCubeForeignObj):
                 self.make_foreign_cube(obj)
-            elif isinstance(obj, worldmap.MarkerObj):
-                self.make_marker(obj)
+            elif isinstance(obj, worldmap.CustomMarkerObj):
+                self.make_custom_marker(obj)
+            elif isinstance(obj, worldmap.ArucoMarkerObj):
+                self.make_aruco_marker(obj)
+        # Make the doorways last, so transparency works correctly
+        for (key,obj) in items:
+            if isinstance(obj, worldmap.DoorwayObj):
+                self.make_doorway(obj)
 
     def make_memory(self):
         global gl_lists
@@ -773,11 +842,11 @@ class WorldMapViewer():
         gl_lists = []
         self.make_axes()
         self.make_gazepoint()
-        self.make_objects()  # walls, light cubes, custom cubes, and chips
         self.make_charger()
         self.make_cozmo_robot()
         self.make_memory()
         self.make_floor()
+        self.make_objects()  # walls, light cubes, custom cubes, and chips
 
     def del_shapes(self):
         global gl_lists
@@ -788,7 +857,7 @@ class WorldMapViewer():
 
     def window_creator(self):
         global WINDOW
-        WINDOW = opengl.create_window(self.windowName, (self.width,self.height))        
+        WINDOW = opengl.create_window(bytes(self.windowName,'utf-8'), (self.width,self.height))
         glutDisplayFunc(self.display)
         glutReshapeFunc(self.reshape)
         glutKeyboardFunc(self.keyPressed)
@@ -797,7 +866,8 @@ class WorldMapViewer():
         glClearColor(*self.bgcolor, 0)
         glEnable(GL_DEPTH_TEST)
         glShadeModel(GL_SMOOTH)
-        # Enable transparency
+        # Enable transparency for doorways: see
+        #    https://www.opengl.org/archives/resources/faq/technical/transparency.htm
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
@@ -808,9 +878,14 @@ class WorldMapViewer():
             opengl.CREATION_QUEUE.append(self.window_creator)
             while not WINDOW:
                 time.sleep(0.1)
-        print("Type 'h' in the world map window for help.")
+        if pf.system() == 'Darwin':
+            print("Type 'option' + 'h' in the world map window for help.")
+        else:
+            print("Type 'h' in the world map window for help.")
 
     def display(self):
+        global DISPLAY_ENABLED, EXCEPTION_COUNTER
+        if not DISPLAY_ENABLED: return
         global gl_lists
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glMatrixMode(GL_PROJECTION)
@@ -840,13 +915,24 @@ class WorldMapViewer():
             camera_distance * sin(radians(pitch)) + fixation_point[2]
             ]
         gluLookAt(*camera_loc, *fixation_point, 0.0, 0.0, 1.0)
-        self.make_shapes()
-        for id in gl_lists:
-            glCallList(id)
-        glutSwapBuffers()
-        self.del_shapes()
+        try:
+            self.make_shapes()
+            for id in gl_lists:
+                glCallList(id)
+            glutSwapBuffers()
+            self.del_shapes()
+        except Exception as e:
+            print('Worldmap viewer exception:',e)
+            EXCEPTION_COUNTER += 1
+            if EXCEPTION_COUNTER >= 2:
+                print('\n\nworldmap_viewer:  Too many errors.  Stopping redisplay.')
+                DISPLAY_ENABLED = False
+            else:
+                raise
+
 
     def keyPressed(self, key, x, y):
+        global DISPLAY_ENABLED, EXCEPTION_COUNTER
         if ord(key) == 27:
             print("Use 'exit' to quit.")
             #return
@@ -882,7 +968,10 @@ class WorldMapViewer():
         elif key == b'm':
             self.show_memory_map = not self.show_memory_map
         elif key == b'h':
-            print(help_text)
+            if pf.system() == 'Darwin':
+                print(help_text_mac)
+            else:
+                print(help_text)
         elif key == b'v':
             print_camera = not print_camera
             if not print_camera:
@@ -891,6 +980,12 @@ class WorldMapViewer():
             fixation_point = initial_fixation_point.copy()
             camera_rotation = initial_camera_rotation.copy()
             camera_distance = initial_camera_distance
+        elif key == b'#':
+            DISPLAY_ENABLED = not DISPLAY_ENABLED
+            if DISPLAY_ENABLED:
+                EXCEPTION_COUNTER = 0
+            print('Worldmap viewer redisplay %sabled.' %
+                  'en' if DISPLAY_ENABLED else 'dis')
         if print_camera:
             pitch = camera_rotation[1]
             yaw = camera_rotation[2]
@@ -922,4 +1017,3 @@ class WorldMapViewer():
         self.height = height
         self.aspect = self.width/self.height
         glViewport(0, 0, width, height)
-

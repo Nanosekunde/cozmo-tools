@@ -1,14 +1,17 @@
-from math import pi, sin, cos, inf, asin, atan2, nan, isnan
+from math import pi, sin, cos, inf, asin, atan2, nan, isnan, ceil
 import numpy as np
 import random
 import time
+import math
 
 import cozmo_fsm.transform
 from .transform import wrap_angle
 
 from .rrt_shapes import *
 from .cozmo_kin import center_of_rotation_offset
-from .worldmap import WallObj, wall_marker_dict, LightCubeObj, CustomCubeObj, ChipObj, RobotForeignObj
+from .wavefront import WaveFront
+from .worldmap import WallObj, wall_marker_dict, RoomObj, LightCubeObj
+from .worldmap import CustomCubeObj, ChargerObj, CustomMarkerObj, ChipObj, RobotForeignObj
 
 # *** TODO: Collision checking needs to use opposite headings
 # for treeB nodes because robot is asymmetric.
@@ -42,12 +45,18 @@ class RRTNode():
 
 #---------------- RRT Path Planner ----------------
 
-class StartCollides(Exception): pass
-class GoalCollides(Exception): pass
-class MaxIterations(Exception): pass
+class RRTException(Exception):
+    def __str__(self):
+        return self.__repr__()
+
+class StartCollides(RRTException): pass
+class GoalCollides(RRTException): pass
+class MaxIterations(RRTException): pass
 
 class RRT():
-    def __init__(self, robot, max_iter=1000, step_size=10, arc_radius=40,
+    DEFAULT_MAX_ITER = 2000
+
+    def __init__(self, robot, max_iter=DEFAULT_MAX_ITER, step_size=10, arc_radius=40,
                  xy_tolsq=90, q_tol=5*pi/180,
                  obstacles=[], auto_obstacles=True,
                  bounds=(range(-500,500), range(-500,500))):
@@ -65,9 +74,13 @@ class RRT():
         self.treeB = []
         self.start = None
         self.goal = None
+        self.wf = WaveFront()
+        self.bbox = None
+        self.path = []
+        self.draw_path = []
 
     REACHED = 'reached'
-    COLLISION = 'collision' 
+    COLLISION = 'collision'
     INTERPOLATE = 'interpolate'
 
     def set_obstacles(self,obstacles):
@@ -142,49 +155,119 @@ class RRT():
             for obstacle in self.obstacles:
                 if part.collides(obstacle):
                     return obstacle
-        return False        
+        return False
+
+    def all_colliders(self, node):
+        result = []
+        for part in self.robot_parts_to_node(node):
+            for obstacle in self.obstacles:
+                if part.collides(obstacle):
+                    result.append(part)
+        return result
 
     def plan_push_chip(self, start, goal, max_turn=20*(pi/180), arc_radius=40.):
         return self.plan_path(start, goal, max_turn, arc_radius)
 
-    def plan_path(self, start, goal, max_turn=pi, arc_radius=40):
+    def plan_path(self, start, goal, max_turn=pi, arc_radius=40, use_wf=False):
         self.max_turn = max_turn
         self.arc_radius = arc_radius
         if self.auto_obstacles:
-            self.generate_obstacles()
+            if use_wf:
+                obstacle_inflation = 10  # must be << pilot's escape_distance
+                passageway_adjustment = -40  # narrow doorways for WaveFront
+            else: # use RRT
+                obstacle_inflation = 5
+                passageway_adjustment = +77  # widen doorways for RRT
+            self.generate_obstacles(obstacle_inflation, passageway_adjustment)
         self.start = start
         self.goal = goal
         self.target_heading = goal.q
-        if isnan(self.target_heading):
-            offset_goal = goal
-        else:
-            offset_x = goal.x + center_of_rotation_offset * cos(goal.q)
-            offset_y = goal.y + center_of_rotation_offset * sin(goal.q)
-            offset_goal = RRTNode(x=offset_x, y=offset_y, q=goal.q)
-        self.offset_goal = offset_goal
+        self.bbox = self.get_bounding_box()
 
-        # Check if start collides
+        # Check for StartCollides
         collider = self.collides(start)
         if collider:
             raise StartCollides(start,collider,collider.obstacle)
 
-        # Check if goal collides
-        if not isnan(self.offset_goal.q):
-            collider = self.collides(self.offset_goal)
-        else:  # no goal orientation specified, so try them all
-            temp_goal = self.offset_goal.copy()
-            for theta in range(0,360,10):
-                temp_goal.q = theta/180*pi
+        # Use WaveFront
+        if use_wf:
+
+            temp_goal = goal.copy()
+            if isnan(temp_goal.q):
+                headings = range(0, 360, 10)
+            else:
+                headings = [temp_goal.q]
+            for phi in headings:
+                temp_goal.q = phi/180*pi
                 collider = self.collides(temp_goal)
                 if not collider:
                     break
-        if collider:
-            raise GoalCollides(goal,collider,collider.obstacle)
+            if collider:
+                raise GoalCollides(goal,collider,collider.obstacle)
 
-        treeA = [start]
-        treeB = [offset_goal]
+            self.wf.initialize_grid(bbox=self.bbox)
+            wf_start = (start.x, start.y)
+            wf_goal = (goal.x, goal.y)
+            inflation = 10
+            for obstacle in self.obstacles:
+                self.wf.add_obstacle(obstacle, inflation)
+            self.wf.set_goal(*wf_goal)
+
+            try:
+                result = self.wf.propagate(*wf_start)
+            except ValueError:
+                raise StartCollides(start,None,None)
+
+            if result:
+                path = self.wf.extract(result)
+                self.path = self.transform_path(path)
+                # re-generate obstacles with normal doors so path smoothing will work
+                self.generate_obstacles(5, 0)
+                self.smooth_path()
+            else:
+                raise MaxIterations()
+            return [], [], self.path
+
+        # Set up treeA with start node
+        treeA = [start.copy()]
         self.treeA = treeA
-        self.treeB = treeB
+
+        # Set up treeB with goal node(s)
+        if not isnan(self.target_heading):
+            offset_x = goal.x + center_of_rotation_offset * cos(goal.q)
+            offset_y = goal.y + center_of_rotation_offset * sin(goal.q)
+            offset_goal = RRTNode(x=offset_x, y=offset_y, q=goal.q)
+            collider = self.collides(offset_goal)
+            if collider:
+                raise GoalCollides(goal,collider,collider.obstacle)
+            treeB = [offset_goal]
+            self.treeB = treeB
+        else:  # target_heading is nan
+            treeB = [goal.copy()]
+            self.treeB = treeB
+            temp_goal = goal.copy()
+            offset_goal = goal.copy()
+            for theta in range(0,360,10):
+                q = theta/180*pi
+                step = max(self.step_size, abs(center_of_rotation_offset))
+                temp_goal.x = goal.x + step*cos(q)
+                temp_goal.y = goal.y + step*sin(q)
+                temp_goal.q = wrap_angle(q+pi)
+                collider = self.collides(temp_goal)
+                if collider: continue
+                offset_goal.x = temp_goal.x + center_of_rotation_offset * cos(q)
+                offset_goal.y = temp_goal.y + center_of_rotation_offset * sin(q)
+                offset_goal.q = temp_goal.q
+                collider = self.collides(offset_goal)
+                if not collider:
+                    treeB.append(RRTNode(parent=treeB[0], x=temp_goal.x, y=temp_goal.y, q=temp_goal.q))
+            if len(treeB) == 1:
+                raise GoalCollides(goal,collider,collider.obstacle)
+
+        # Set bounds for search area
+        self.compute_world_bounds(start,goal)
+
+        # Grow the RRT until trees meet or max_iter exceeded
         swapped = False
         for i in range(self.max_iter):
             r = self.random_node()
@@ -193,14 +276,37 @@ class RRT():
                 (status, new_node) = self.extend(treeB, treeA[-1])
                 if status is self.REACHED:
                     break
-                (treeB, treeA) = (treeA, treeB)
-                swapped = not swapped
+            (treeA, treeB) = (treeB, treeA)
+            swapped = not swapped
+        # Search terminated. Check for success.
         if swapped:
-            (treeB, treeA) = (treeA, treeB)
+            (treeA, treeB) = (treeB, treeA)
         if status is self.REACHED:
             return self.get_path(treeA, treeB)
         else:
             raise MaxIterations(self.max_iter)
+
+    def compute_world_bounds(self,start,goal):
+        xmin = min(start.x, goal.x)
+        xmax = max(start.x, goal.x)
+        ymin = min(start.y, goal.y)
+        ymax = max(start.y, goal.y)
+        for obst in self.obstacles:
+            if isinstance(obst,Circle):
+                xmin = obst.center[0] - obst.radius
+                xmax = obst.center[0] + obst.radius
+                ymin = obst.center[1] - obst.radius
+                ymax = obst.center[1] + obst.radius
+            else:
+                xmin = min(xmin, np.min(obst.vertices[0]))
+                xmax = max(xmax, np.max(obst.vertices[0]))
+                ymin = min(ymin, np.min(obst.vertices[1]))
+                ymax = max(ymax, np.max(obst.vertices[1]))
+        xmin = xmin - 500
+        xmax = xmax + 500
+        ymin = ymin - 500
+        ymax = ymax + 500
+        self.bounds = (range(int(xmin), int(xmax)), range(int(ymin), int(ymax)))
 
     def get_path(self, treeA, treeB):
         nodeA = treeA[-1]
@@ -212,12 +318,15 @@ class RRT():
         # treeB was built backwards from the goal, so headings
         # need to be reversed
         nodeB = treeB[-1]
-        pathB = []
         prev_heading = wrap_angle(nodeB.q + pi)
-        while nodeB.parent is not None:
-            nodeB = nodeB.parent
-            (nodeB.q, prev_heading) = (prev_heading, wrap_angle(nodeB.q+pi))
-            pathB.append(nodeB.copy())
+        if nodeB.parent is None:
+            pathB = [nodeB.copy()]
+        else:
+            pathB = []
+            while nodeB.parent is not None:
+                nodeB = nodeB.parent
+                (nodeB.q, prev_heading) = (prev_heading, wrap_angle(nodeB.q+pi))
+                pathB.append(nodeB.copy())
         (pathA,pathB) = self.join_paths(pathA,pathB)
         self.path = pathA + pathB
         self.smooth_path()
@@ -234,7 +343,7 @@ class RRT():
         turn_angle = wrap_angle(pathB[0].q - pathA[-1].q)
         if abs(turn_angle) <= self.max_turn:
             return (pathA,pathB)
-        print('*** JOIN PATHS: ', turn_angle*180/pi)
+        print('*** JOIN PATHS EXCEEDED MAX TURN ANGLE: ', turn_angle*180/pi)
         return (pathA,pathB)
 
     def smooth_path(self):
@@ -322,7 +431,7 @@ class RRT():
             smoothed_path = smoothed_path[:i+1] + \
                             [turn_node1, next_node, turn_node2] + \
                             smoothed_path[j+1:]
-        return smoothed_path        
+        return smoothed_path
 
     def calculate_arc(self, node_i, node_j):
         # Compute arc node parameters to get us on a heading toward node_j.
@@ -336,7 +445,7 @@ class RRT():
         dir = +1 if direct_turn_angle >=0 else -1
         cx = cur_x + self.arc_radius * cos(cur_q + dir*pi/2)
         cy = cur_y + self.arc_radius * sin(cur_q + dir*pi/2)
-        dx = cx - dest_x 
+        dx = cx - dest_x
         dy = cy - dest_y
         center_dist = sqrt(dx*dx + dy*dy)
         if center_dist < self.arc_radius:  # turn would be too wide: punt
@@ -413,37 +522,56 @@ class RRT():
         turn_node = RRTNode(next_node, tang_x, tang_y, tang_q, radius=radius)
         return (next_node, turn_node)
 
+    def transform_path(self, path):
+        """
+        Transform a path with coordinates to RRTNode
+        """
+        for i in range(len(path)):
+            if i==0:
+                path[i] = RRTNode(x=path[i][0], y=path[i][1], q=math.nan)
+            else:
+                path[i] = RRTNode(parent=path[i-1], x=path[i][0], y=path[i][1], q=math.nan)
+                path[i-1].q = atan2(path[i].y - path[i-1].y, path[i].x - path[i-1].x)
+        return path
+
+
     #---------------- Obstacle Representation ----------------
 
-    def generate_obstacles(self):
+    def generate_obstacles(self, obstacle_inflation=0, passageway_adjustment=0):
         self.robot.world.world_map.update_map()
         obstacles = []
         for obj in self.robot.world.world_map.objects.values():
-            if not obj.obstacle: continue
+            if not obj.is_obstacle: continue
+            if self.robot.carrying is obj: continue
+            if obj.pose_confidence < 0: continue
             if isinstance(obj, WallObj):
-                obstacles = obstacles + self.generate_wall_obstacles(obj)
-            elif isinstance(obj, (LightCubeObj,CustomCubeObj)):
+                obstacles = obstacles + \
+                            self.generate_wall_obstacles(obj, obstacle_inflation, passageway_adjustment)
+            elif isinstance(obj, (LightCubeObj,CustomCubeObj,ChargerObj)):
                 obstacles.append(self.generate_cube_obstacle(obj))
+            elif isinstance(obj, CustomMarkerObj):
+                obstacles.append(self.generate_marker_obstacle(obj))
             elif isinstance(obj, ChipObj):
                 obstacles.append(self.generate_chip_obstacle(obj))
             elif isinstance(obj, RobotForeignObj):
                obstacles.append(self.generate_foreign_obstacle(obj))
         self.obstacles = obstacles
 
-    def generate_wall_obstacles(self,wall):
-        wall_spec = wall_marker_dict[wall.id]
+    def generate_wall_obstacles(self, wall, obstacle_inflation, passageway_adjustment):
+        wall_spec = wall_marker_dict[wall.spec_id]
         half_length = wall.length / 2
         widths = []
         last_x = -half_length
-        edges = [ [0, -half_length, 0., 1.] ]
+        edges = [ [0, -half_length-obstacle_inflation, 0., 1.] ]
         for (center,width) in wall_spec.doorways:
+            width += passageway_adjustment + obstacle_inflation  # widen doorways for RRT, narrow for WaveFront
             left_edge = center - width/2 - half_length
             edges.append([0., left_edge, 0., 1.])
             widths.append(left_edge - last_x)
             right_edge = center + width/2 - half_length
             edges.append([0., right_edge, 0., 1.])
             last_x = right_edge
-        edges.append([0., half_length, 0., 1.])
+        edges.append([0., half_length+obstacle_inflation, 0., 1.])
         widths.append(half_length-last_x)
         edges = np.array(edges).T
         edges = transform.aboutZ(wall.theta).dot(edges)
@@ -451,7 +579,7 @@ class RRT():
         obst = []
         for i in range(0,len(widths)):
             center = edges[:,2*i:2*i+2].mean(1).reshape(4,1)
-            dimensions=(4.0, widths[i])
+            dimensions=(4.0+obstacle_inflation, widths[i])
             r = Rectangle(center=center,
                           dimensions=dimensions,
                           orient=wall.theta )
@@ -465,6 +593,15 @@ class RRT():
                       orient=obj.theta)
         r.obstacle = obj
         return r
+
+    def generate_marker_obstacle(self,obj):
+        sx,sy,sz = obj.size
+        r = Rectangle(center=transform.point(obj.x+sx/2, obj.y),
+                      dimensions=(sx,sy),
+                      orient=obj.theta)
+        r.obstacle = obj
+        return r
+
 
     def generate_chip_obstacle(self,obj):
         r = Circle(center=transform.point(obj.x,obj.y),
@@ -488,3 +625,21 @@ class RRT():
                 result.append(robot_obst)
         return result
 
+    def get_bounding_box(self):
+        xmin = self.robot.world.particle_filter.pose[0]
+        ymin = self.robot.world.particle_filter.pose[1]
+        xmax = xmin
+        ymax = ymin
+        objs =  self.robot.world.world_map.objects.values()
+        # Rooms aren't obstacles, so include them separately.
+        rooms = [obj for obj in objs if isinstance(obj,RoomObj)]
+        # Cubes and markers may not be obstacles if they are goal locations, so include them again.
+        goals = [obj for obj in objs if isinstance(obj,(LightCubeObj,CustomMarkerObj)) and obj.pose_confidence >= 0]
+        for obj in self.obstacles + rooms + goals:
+            ((x0,y0),(x1,y1)) = obj.get_bounding_box()
+            xmin = min(xmin, x0)
+            ymin = min(ymin, y0)
+            xmax = max(xmax, x1)
+            ymax = max(ymax, y1)
+        bbox = ((xmin,ymin), (xmax,ymax))
+        return bbox

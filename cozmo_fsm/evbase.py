@@ -7,6 +7,7 @@
 """
 
 import functools
+from multiprocessing import Queue
 
 import cozmo
 
@@ -43,6 +44,22 @@ class EventRouter:
         self.wildcard_registry = dict()
         # event generator objects
         self.event_generators = dict()
+        # running processes
+        self.processes = dict()  # id -> node
+        self.interprocess_queue = Queue()
+
+    def start(self):
+        self.clear()
+        self.poll_processes()
+
+    def clear(self):
+        self.dispatch_table.clear()
+        self.listener_registry.clear()
+        self.wildcard_registry.clear()
+        self.event_generators.clear()
+        self.processes.clear()
+        self.interprocess_queue.close()
+        self.interprocess_queue = Queue()
 
     def add_listener(self, listener, event_class, source):
         if not issubclass(event_class, Event):
@@ -68,10 +85,11 @@ class EventRouter:
         reg_entry.append((event_class,source))
         self.listener_registry[listener] = reg_entry
 
-    # Transitions like =Hear('\w')=> must use None as a source because
-    # they do the matching themselves instead of relying on the event
-    # router. So to distinguish a wildcard =Hear=> transition from
-    # all the other Hear transitions, we must register it specially.
+    # Transitions like =Hear('foo')=> must use None as the source
+    # value because they do the matching themselves instead of relying
+    # on the event router. So to distinguish a wildcard =Hear=>
+    # transition, which must be invoked last, from all the other Hear
+    # transitions, we must register it specially.
     def add_wildcard_listener(self, listener, event_class, source):
         self.add_listener(listener, event_class, source)
         self.wildcard_registry[listener.handle_event] = True
@@ -138,6 +156,25 @@ class EventRouter:
                 print('TRACE%d:' % TRACE.listener_invocation, listener.__class__, 'receiving', event)
             self.robot.loop.call_soon(listener,event)
     
+    def add_process_node(self, node):
+        self.processes[id(node)] = node
+
+    def delete_process_node(self, node):
+        node_id = id(node)
+        if node_id in self.processes:
+            del self.processes[node_id]
+
+    POLLING_INTERVAL = 0.1
+
+    def poll_processes(self):
+        while not self.interprocess_queue.empty():
+            (id,event) = self.interprocess_queue.get()
+            node = self.processes[id]
+            event.source = node
+            print('Node %s returned %s' % (node,event))
+            self.post(event)
+        self.robot.loop.call_later(self.POLLING_INTERVAL, self.poll_processes)
+
 #________________ Event Listener ________________
 
 class EventListener:

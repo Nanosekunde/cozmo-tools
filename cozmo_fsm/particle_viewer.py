@@ -14,18 +14,65 @@ import math
 from math import sin, cos, pi, atan2, sqrt
 import array
 import numpy as np
+import platform
 
 import cozmo
 from cozmo.util import distance_mm, speed_mmps, degrees
 
 from . import opengl
+from .worldmap import ArucoMarkerObj
 
 REDISPLAY = True   # toggle this to suspend constant redisplay
 WINDOW = None
 
+help_text = """
+Particle viewer commands:
+  w/a/s/d    Drive robot +/- 10 mm or turn +/- 22.5 degrees
+  W/A/S/D    Drive robot +/- 40 mm or turn +/- 90 degrees
+  i/k        Head up/down 5 degrees
+  I/K        Head up/down 20 degrees
+  e          Evaluate particles using current sensor info
+  r          Resample particles (evaluates first)
+  z          Reset particle positions (randomize, or all 0 for SLAM)
+  c          Clear landmarks (for SLAM)
+  o          Show objects
+  p          Show best particle
+  arrows     Translate the view up/down/left/right
+  Home       Center the view (zero translation)
+  <          Zoom in
+  >          Zoom out
+  $          Toggle redisplay (for debugging)
+  v          Toggle verbosity
+  V          Display weight variance
+  h          Print this help text
+"""
+
+help_text_mac = """
+Particle viewer commands:
+  option + w/a/s/d    Drive robot +/- 10 mm or turn +/- 22.5 degrees
+  option + W/A/S/D    Drive robot +/- 40 mm or turn +/- 90 degrees
+  option + i/k        Head up/down 5 degrees
+  option + I/K        Head up/down 20 degrees
+  option + e          Evaluate particles using current sensor info
+  option + r          Resample particles (evaluates first)
+  option + z          Reset particle positions (randomize, or all 0 for SLAM)
+  option + c          Clear landmarks (for SLAM)
+  option + o          Show objects
+  option + p          Show best particle
+  arrows              Translate the view up/down/left/right
+  fn + left-arrow     Center the view (zero translation)
+  option + <          Zoom in
+  option + >          Zoom out
+  option + $          Toggle redisplay (for debugging)
+  option + v          Toggle verbosity
+  option + V          Display weight variance
+  option + h          Print this help text
+"""
+
+
 class ParticleViewer():
     def __init__(self, robot,
-                 width=512, height=512, scale=1.0,
+                 width=512, height=512, scale=0.64,
                  windowName = "particle viewer",
                  bgcolor = (0,0,0)):
         self.robot=robot
@@ -33,13 +80,14 @@ class ParticleViewer():
         self.height = height
         self.bgcolor = bgcolor
         self.aspect = self.width/self.height
-        self.translation = [0., 0.]  # Translation in mm
+        self.translation = [200., 0.]  # Translation in mm
         self.scale = scale
+        self.verbose = False
         self.windowName = windowName
 
     def window_creator(self):
         global WINDOW
-        WINDOW = opengl.create_window(self.windowName, (self.width,self.height))        
+        WINDOW = opengl.create_window(bytes(self.windowName, 'utf-8'), (self.width,self.height))
         glutDisplayFunc(self.display)
         glutReshapeFunc(self.reshape)
         glutKeyboardFunc(self.keyPressed)
@@ -56,7 +104,10 @@ class ParticleViewer():
             opengl.CREATION_QUEUE.append(self.window_creator)
             while not WINDOW:
                 time.sleep(0.1)
-        print("Type 'h' in the particle viewer window for help.")
+        if platform.system() == 'Darwin':
+            print("Type 'option' + 'h' in the particle viewer window for help.")
+        else:
+            print("Type 'h' in the particle viewer window for help.")
 
     def draw_rectangle(self, center, size=(10,10),
                        angle=0, color=(1,1,1), fill=True):
@@ -145,45 +196,72 @@ class ParticleViewer():
         glPopMatrix()
 
     def draw_landmarks(self):
-        landmarks = self.robot.world.particle_filter.sensor_model.landmarks
+        landmarks = self.robot.world.particle_filter.sensor_model.landmarks.copy()
         if not landmarks: return
-        # Extract keys and values as quickly as we can because
+        # Extract values as quickly as we can because
         # dictionary can change while we're iterating.
-        id_list = list(landmarks.keys())
-        specs_list = list(landmarks.values())
-        for (id,specs) in zip(id_list,specs_list):
-            if isinstance(id, cozmo.objects.LightCube):
-                seen = id.is_visible
-                label = next(k for k,v in self.robot.world.light_cubes.items() if v==id)
-            elif isinstance(id, str) and 'Video' in id:
+        objs = self.robot.world.world_map.objects.copy()
+        arucos = [(marker.id, (np.array([[marker.x], [marker.y]]), marker.theta, None))
+                  for marker in objs.values()
+                  if isinstance(marker, ArucoMarkerObj)]
+        all_specs = list(landmarks.items()) + \
+            [marker for marker in arucos if marker[0] not in landmarks]
+        for (id,specs) in all_specs:
+            if not isinstance(id,str):
+                raise TypeError("Landmark id's must be strings: %r" % id)
+            color = None
+            if id.startswith('Aruco-'):
+                label = id[6:]
+                num = int(label)
+                seen = num in self.robot.world.aruco.seen_marker_ids
+            elif id.startswith('Cube-'):
+                label = id[5:]
+                num = int(label)
+                cube = self.robot.world.light_cubes[num]
+                seen = cube.is_visible
+                if seen:
+                    color = (0.5, 0.3, 1, 0.75)
+                else:
+                    color = (0, 0, 0.5, 0.75)
+            elif id.startswith('Wall-'):
+                label = 'W' + id[id.find('-')+1:]
+                try:
+                    seen = self.robot.world.world_map.objects[id].is_visible
+                except:
+                    seen = False
+                if seen:
+                    color = (1, 0.5, 0.3, 0.75)
+                else:
+                    color = (0.5, 0, 0, 0.75)
+            elif id.startswith('Video'):
                 seen = self.robot.aruco_id in self.robot.world.perched.camera_pool and \
-                                    id in self.robot.world.perched.camera_pool[self.robot.aruco_id]
+                       id in self.robot.world.perched.camera_pool[self.robot.aruco_id]
                 label = id
-            else:
-                seen = id in self.robot.world.aruco.seen_marker_ids
-                label = id
-            if seen:
-                color = (0.5, 1, 0.3, 0.75)
-            else:
-                color = (0, 0.5, 0, 0.75)
+            if color is None:
+                if seen:
+                    color = (0.5, 1, 0.3, 0.75)
+                else:
+                    color = (0, 0.5, 0, 0.75)
             if isinstance(specs, cozmo.util.Pose):
                 self.draw_landmark_from_pose(id, specs, label, color)
             else:
                 self.draw_landmark_from_particle(id, specs, label, color)
 
     def draw_landmark_from_pose(self, id, specs, label, color):
-        coords = (specs.position.x, specs.position.y, 0.)
+        coords = (specs.position.x, specs.position.y)
         angle = specs.rotation.angle_z.degrees
-        if isinstance(id, cozmo.objects.LightCube):
+        if id.startswith('LightCube'):
             size = (44,44)
-        else:
+            angle_adjust = 0
+        else:  # Aruco
             size = (20,50)
+            angle_adjust = 90
         glPushMatrix()
         glColor4f(*color)
         self.draw_rectangle(coords, size=size, angle=angle, color=color)
         glColor4f(0., 0., 0., 1.)
-        glTranslatef(*coords)
-        glRotatef(angle-90, 0., 0., 1.)
+        glTranslatef(*coords,0)
+        glRotatef(angle + angle_adjust, 0., 0., 1.)
         label_str = ascii(label)
         glTranslatef(3.-7*len(label_str), -5., 0.)
         glScalef(0.1,0.1,0.1)
@@ -196,32 +274,49 @@ class ParticleViewer():
         coords = (lm_mu[0,0], lm_mu[1,0])
         glPushMatrix()
         glColor4f(*color)
-        if isinstance(id, cozmo.objects.LightCube):
+        if id.startswith('Cube'):
             size = (44,44)
-        else:
+            angle_offset = -90
+            translate = 0
+        elif id.startswith('Wall'):
+            try:
+                wall = self.robot.world.world_map.objects[id]
+            except KeyError:  # race condition: not in worldmap yet
+                return
+            size = (20, wall.length)
+            angle_offset = 90
+            translate = 0
+        else: # Aruco
             size = (20,50)
-        if isinstance(id,str) and 'Video' in id:
+            angle_offset = 90
+            translate = 15
+        if id.startswith('Video'):
             self.draw_triangle(coords, height=75, angle=lm_orient[1]*(180/pi),
                                color=color, fill=True)
             glColor4f(0., 0., 0., 1.)
             glTranslatef(*coords,0)
-            glRotatef(lm_orient[1]*(180/pi)-90, 0., 0., 1.)
+            glRotatef(lm_orient[1]*(180/pi)+angle_offset, 0., 0., 1.)
         else:
-            self.draw_rectangle(coords, size=size, angle=lm_orient, color=color)
+            glTranslatef(*coords,0.)
+            glRotatef(lm_orient*180/pi, 0., 0., 1.)
+            glTranslatef(translate, 0., 0.)
+            self.draw_rectangle([0,0], size=size, angle=0, color=color)
+            #self.draw_rectangle(coords, size=size, angle=lm_orient*(180/pi), color=color)
             glColor4f(0., 0., 0., 1.)
-            glTranslatef(*coords,0)
-            glRotatef(lm_orient*(180/pi)-90, 0., 0., 1.)
-        label_str = ascii(label)
-        glTranslatef(3.-7*len(label_str), -5., 0.)
-        glScalef(0.1,0.1,0.1)
-        for char in label_str:
+            #glTranslatef(*coords,0)
+            #glRotatef(lm_orient*(180/pi)+angle_offset, 0., 0., 1.)
+            glRotatef(angle_offset, 0., 0., 1.)
+        glTranslatef(3.0-7*len(label), -5.0, 0.0)
+        glScalef(0.1, 0.1, 0.1)
+        for char in label:
             glutStrokeCharacter(GLUT_STROKE_MONO_ROMAN, ord(char))
         glPopMatrix()
         ellipse_color = (color[1], color[2], color[0], 1)
         self.draw_particle_landmark_ellipse(lm_mu, lm_sigma, ellipse_color)
 
-    def draw_particle_landmark_ellipse(self,coords,sigma,color):
-        (w,v) = np.linalg.eigh(sigma)
+    def draw_particle_landmark_ellipse(self, coords, sigma, color):
+        if sigma is None: return   # Arucos that are not solo landmarks
+        (w,v) = np.linalg.eigh(sigma[0:2,0:2])
         alpha = atan2(v[1,0],v[0,0])
         self.draw_ellipse(coords, abs(w)**0.5, alpha*(180/pi), color=color)
 
@@ -284,13 +379,14 @@ class ParticleViewer():
         var = np.var(weights)
         print('weights:  min = %3.3e  max = %3.3e med = %3.3e  variance = %3.3e' %
               (weights[0], weights[-1], weights[pf.num_particles//2], var))
-        (xy_var,theta_var) = pf.variance
+        (xy_var, theta_var) = pf.variance
         print ('xy_var=', xy_var, '  theta_var=', theta_var)
-        
+
     def report_pose(self):
         (x,y,theta) = self.robot.world.particle_filter.pose
         hdg = math.degrees(theta)
-        print('Pose = (%5.1f, %5.1f) @ %3d deg.' % (x, y, hdg))
+        if self.verbose:
+            print('Pose = (%5.1f, %5.1f) @ %3d deg.' % (x, y, hdg))
 
     async def forward(self,distance):
         handle = self.robot.drive_straight(distance_mm(distance), speed_mmps(50),
@@ -303,6 +399,13 @@ class ParticleViewer():
 
     async def turn(self,angle):
         handle = self.robot.turn_in_place(degrees(angle), in_parallel=True)
+        await handle.wait_for_completed()
+        pf = self.robot.world.particle_filter
+        self.robot.loop.call_later(0.1, pf.look_for_new_landmarks)
+        self.report_pose()
+
+    async def look(self,angle):
+        handle = self.robot.set_head_angle(degrees(angle), in_parallel=True)
         await handle.wait_for_completed()
         pf = self.robot.world.particle_filter
         self.robot.loop.call_later(0.1, pf.look_for_new_landmarks)
@@ -338,20 +441,45 @@ class ParticleViewer():
             self.robot.loop.create_task(self.turn(-rotate_wasd))
         elif key == b'D':     # right
             self.robot.loop.create_task(self.turn(-rotate_WASD))
-        elif key == b'z':     # randomize
-            pf.initializer.initialize(pf.particles)
+        elif key == b'i':     # head up
+            ang = self.robot.head_angle.degrees + 5
+            self.robot.loop.create_task(self.look(ang))
+        elif key == b'k':     # head down
+            ang = self.robot.head_angle.degrees - 5
+            self.robot.loop.create_task(self.look(ang))
+        elif key == b'I':     # head up
+            ang = self.robot.head_angle.degrees + 20
+            self.robot.loop.create_task(self.look(ang))
+        elif key == b'K':     # head down
+            ang = self.robot.head_angle.degrees - 20
+            self.robot.loop.create_task(self.look(ang))
+        elif key == b'z':     # delocalize
+            pf.delocalize()
+            #pf.initializer.initialize(self.robot)
+        elif key == b'Z':     # randomize
+            pf.increase_variance()
         elif key == b'c':     # clear landmarks
             pf.clear_landmarks()
             print('Landmarks cleared.')
-        elif key == b'v':     # display weight variance
+        elif key == b'o':     # show objects
+            self.robot.world.world_map.show_objects()
+        elif key == b'p':     # show particle
+            self.robot.world.particle_filter.show_particle()
+        elif key == b'l':     # show landmarks
+            self.robot.world.particle_filter.show_landmarks()
+        elif key == b'V':     # display weight variance
             self.report_variance(pf)
-        elif key == b'+':     # zoom in
+        elif key == b'<':     # zoom in
             self.scale *= 1.25
             self.print_display_params()
             return
-        elif key == b'-':     # zoom out
+        elif key == b'>':     # zoom out
             self.scale /= 1.25
             self.print_display_params()
+            return
+        elif key == b'v':     # toggle verbose mode
+            self.verbose = not self.verbose
+            self.report_pose()
             return
         elif key == b'h':     # print help
             self.print_help()
@@ -361,7 +489,8 @@ class ParticleViewer():
             REDISPLAY = not REDISPLAY
             print('Redisplay ',('off','on')[REDISPLAY],'.',sep='')
         elif key == b'q':     #kill window
-            glutDestroyWindow(self.window)
+            global WINDOW
+            glutDestroyWindow(WINDOW)
             glutLeaveMainLoop()
         glutPostRedisplay()
         self.report_pose()
@@ -384,23 +513,13 @@ class ParticleViewer():
         glutPostRedisplay()
 
     def print_display_params(self):
-        print('scale=%.2f translation=[%.1f, %.1f]' %
-              (self.scale, *self.translation))
+        if self.verbose:
+            print('scale=%.2f translation=[%.1f, %.1f]' %
+                  (self.scale, *self.translation))
         glutPostRedisplay()
 
     def print_help(self):
-        print("""
-Particle viewer commands:
-  w/a/s/d    Drive robot +/- 10 mm or turn +/- 22.5 degrees
-  W/A/S/D    Drive robot +/- 40 mm or turn +/- 90 degrees
-    e        Evaluate particles using current sensor info
-    r        Resample particles (evaluates first)
-    z        Reset particle positions (randomize, or all 0 for SLAM)
-    c        Clear landmarks (for SLAM)
-  arrows     Translate the view up/down/left/right
-   Home      Center the view (zero translation)
-    +        Zoom in
-    -        Zoom out
-    $        Toggle redisplay (for debugging)
-    h        Print this help text
-""")
+        if platform.system() == 'Darwin':
+            print(help_text_mac)
+        else:
+            print(help_text)

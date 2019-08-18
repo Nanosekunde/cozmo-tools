@@ -5,16 +5,19 @@ import types
 import random
 import numpy as np
 import math
+from multiprocessing import Process, Queue
 from math import pi
+import cv2
 
 import cozmo
-from cozmo.util import distance_mm, speed_mmps, degrees, Distance, Angle
+from cozmo.util import distance_mm, speed_mmps, degrees, Distance, Angle, Pose
 
+from . import evbase
 from .base import *
 from .events import *
 from .cozmo_kin import wheelbase
 from .transform import wrap_angle
-from .worldmap import WorldObject
+from .worldmap import WorldObject, FaceObj, CustomMarkerObj
 
 #________________ Ordinary Nodes ________________
 
@@ -72,6 +75,7 @@ class Iterate(StateNode):
         self.post_data(value)
 
 class MoveLift(StateNode):
+    "Move lift at specified speed."
     def __init__(self,speed):
         super().__init__()
         self.speed = speed
@@ -156,29 +160,35 @@ class DriveContinuous(StateNode):
         dist = math.sqrt((self.cur[0]-x)**2 + (self.cur[1]-y)**2)
         if self.pause_counter > 0:
             self.pause_counter -= 1
-            print('p.. x: %5.1f  y: %5.1f  q:%6.1f     dist: %5.1f' %
-                  (x, y, q*180/pi, dist))
+            #print('p.. x: %5.1f  y: %5.1f  q:%6.1f     dist: %5.1f' %
+            #      (x, y, q*180/pi, dist))
             return
         if not self.reached_dist:
             self.reached_dist = \
                 (dist - self.last_dist) > 0.1 and \
                 ( (self.mode == 'x' and np.sign(x-self.cur[0]) == np.sign(self.cur[0]-self.prev[0])) or
                   (self.mode == 'y' and np.sign(y-self.cur[1]) == np.sign(self.cur[1]-self.prev[1])) )
-        reached_waypoint = (self.path_index == 0) or (self.reached_dist and abs(q - self.target_q) < 5*pi/180)
+        # Once reached_dist is true, we can enter mode 'q' where we'll turn  until
+        # the heading error is < 5 degrees, then we've reached the waypoint.
+        reached_waypoint = (self.path_index == 0) or \
+                           (self.reached_dist and \
+                            abs(wrap_angle(q - self.target_q)) < 5*pi/180)
         self.last_dist = dist
 
         # Advance to next waypoint if indicated
         if reached_waypoint:
             self.path_index += 1
-            print('DriveContinuous: path index advanced to',self.path_index)
+            print('DriveContinuous: current position is (%.1f, %.1f) @ %.1f deg.' %
+                  (x, y, q*180/pi))
+            print('   path index advanced to %d' % self.path_index, end='')
             if self.path_index == len(self.path):
-                print('DriveContinous: path complete.  Stopping.')
+                print('\nDriveContinous: path complete.  Stopping.')
                 self.robot.stop_all_motors()
                 self.post_completion()
                 return
             elif self.path_index > len(self.path):
                 # uncaught completion event
-                print('DriveContinuous: uncaught completion! Stopping.')
+                print('\nDriveContinuous: uncaught completion! Stopping.')
                 self.stop()
                 return
             self.prev = self.cur
@@ -186,12 +196,18 @@ class DriveContinuous(StateNode):
             self.last_dist = math.inf
             self.reached_dist = False
             self.target_q = math.atan2(self.cur[1]-self.prev[1], self.cur[0]-self.prev[0])
+            print(': [%.1f, %.1f] tgtQ is %.1f deg.' % (*self.cur, self.target_q*180/pi))
 
             # Is the target behind us?
-            delta_q = wrap_angle(q - self.target_q)
+            delta_q = wrap_angle(self.target_q - q)
             delta_dist = math.sqrt((self.cur[0]-x)**2 + (self.cur[1]-y)**2)
-            if abs(delta_q) > pi/2:
-                print('DriveCont--> delta_q =',delta_q*180/pi,'degrees   delta_dist=',delta_dist)
+            if False and abs(delta_q) > 135*pi/180:
+                #self.target_q = wrap_angle(self.target_q + pi)
+                self.drive_direction = -1
+                print('Driving backwards --> delta_q = %.1f deg., new target_q = %.1f deg., dist = %.1f' %
+                      (delta_q*180/pi, self.target_q*180/pi, delta_dist))
+            else:
+                self.drive_direction = +1
 
             # Heading determines whether we're solving y=f(x) or x=f(y)
             if abs(self.target_q) < pi/4 or abs(abs(self.target_q)-pi) < pi/4:
@@ -203,11 +219,19 @@ class DriveContinuous(StateNode):
                 self.m = (self.cur[0]-self.prev[0]) / (self.cur[1]-self.prev[1])
                 self.b = self.cur[0] - self.m * (self.cur[1]-self.prev[1])
 
+            # Do we need to turn in place before setting off toward new waypoint?
+            if abs(wrap_angle(q-self.target_q)) > 45*pi/180:
+                self.saved_mode = self.mode
+                self.mode = 'q'
+                print('DriveContinuous: turning to %.1f deg. before driving to waypoint.' %
+                      (self.target_q*180/pi))
+
             if self.path_index > 1:
                 # come to a full stop before trying to change direction
                 self.robot.stop_all_motors()
                 self.pause_counter = 5
                 return
+
         # Haven't reached waypoint yet
         elif self.reached_dist:
             # But we have traveled far enough, so come to a stop and then fix heading
@@ -215,10 +239,17 @@ class DriveContinuous(StateNode):
                 self.robot.stop_all_motors()
                 self.robot.pause_counter = 5
                 self.mode = 'q'  # We're there; now fix our heading
+                if abs(wrap_angle(q-self.target_q)) > 5*pi/180:
+                    print('DriveContinuous: waypoint reached; adjusting heading to %.1f deg.' %
+                          (self.target_q*180/pi))
                 return
+        elif self.mode == 'q' and abs(wrap_angle(q-self.target_q)) < 5*pi/180:
+            print('DriveContinuous: turn to heading complete: heading is %.1f deg.' %
+                  (q*180/pi))
+            self.mode = self.saved_mode
 
         # Calculate error and correction based on present x/y/q position
-        q_error = q - self.target_q
+        q_error = wrap_angle(q - self.target_q)
         #print('DriveCont--> q_error is',q*180/pi,'degrees')
         if self.mode == 'x':      # y = f(x)
             target_y = self.m * (x-self.prev[0]) + self.b
@@ -254,17 +285,17 @@ class DriveContinuous(StateNode):
             qscale = 150
             flag = "  "
         speedinc = qscale * correcting_q
-        lspeed = speed - speedinc
-        rspeed = speed + speedinc
-        """
-        print('%s x: %5.1f  y: %5.1f  q:%6.1f     derr: %5.1f  qerr:%6.1f  corq: %5.1f  inc: %5.1f  dist: %5.1f' %
+        lspeed = self.drive_direction * (speed - self.drive_direction*speedinc)
+        rspeed = self.drive_direction * (speed + self.drive_direction*speedinc)
+
+        """print('%s x: %5.1f  y: %5.1f  q:%6.1f     derr: %5.1f  qerr:%6.1f  corq: %5.1f  inc: %5.1f  dist: %5.1f' %
               (self.mode+flag, x, y, q*180/pi, d_error, q_error*180/pi,
                correcting_q*180/pi, speedinc, dist))
-               """
-        #self.handle = asyncio.ensure_future(self.robot.drive_wheels(lspeed, rspeed, 200, 200))
+        """
         self.robot.drive_wheel_motors(lspeed, rspeed, 200, 200)
 
 class LookAtObject(StateNode):
+    "Continuously adjust head angle to fixate object."
     def __init__(self):
         super().__init__()
         self.object = None
@@ -281,41 +312,72 @@ class LookAtObject(StateNode):
         super().stop()
 
     def poll(self):
-        if isinstance(self.object, WorldObject):
-            rpose = self.robot.world.particle_filter.pose
-            dx = self.object.x - rpose[0]
-            dy = self.object.y - rpose[1]
+        if isinstance(self.object, FaceObj) or isinstance(self.object, CustomMarkerObj):
+            image_box =  self.object.sdk_obj.last_observed_image_box
+            camera_center = self.robot.camera.config.center.y
+            delta = image_box.top_left_y + image_box.height/2 - camera_center
+            adjust_level = 0.1
+            if self.robot.left_wheel_speed.speed_mmps != 0 and self.robot.right_wheel_speed.speed_mmps != 0:
+                adjust_level = 0.2
+            if delta > 15:
+                angle = self.robot.head_angle.radians - adjust_level
+            elif delta < -15:
+                angle = self.robot.head_angle.radians + adjust_level
+            else:
+                angle = self.robot.head_angle.radians
+            angle = cozmo.robot.MAX_HEAD_ANGLE.radians if angle > cozmo.robot.MAX_HEAD_ANGLE.radians else angle
+            angle = cozmo.robot.MIN_HEAD_ANGLE.radians if angle < cozmo.robot.MIN_HEAD_ANGLE.radians else angle
         else:
-            opos = self.object.pose.position
-            rpos = self.robot.pose.position
-            dx = opos.x - rpos.x
-            dy = opos.y - rpos.y
-        dist = math.sqrt(dx**2 + dy**2)
-        if dist < 60:
-            angle = -0.4
-        elif dist < 80:
-            angle = -0.3
-        elif dist < 100:
-            angle = -0.2
-        elif dist < 140:
-            angle = -0.1
-        elif dist < 180:
-            angle = 0
-        else:
-            angle = 0.1
+            if isinstance(self.object, WorldObject):
+                rpose = self.robot.world.particle_filter.pose
+                dx = self.object.x - rpose[0]
+                dy = self.object.y - rpose[1]
+            else:
+                opos = self.object.pose.position
+                rpos = self.robot.pose.position
+                dx = opos.x - rpos.x
+                dy = opos.y - rpos.y
+            dist = math.sqrt(dx**2 + dy**2)
+            if dist < 60:
+                angle = -0.4
+            elif dist < 80:
+                angle = -0.3
+            elif dist < 100:
+                angle = -0.2
+            elif dist < 140:
+                angle = -0.1
+            elif dist < 180:
+                angle = 0
+            else:
+                angle = 0.1
         if abs(self.robot.head_angle.radians - angle) > 0.03:
             self.handle = self.robot.loop.call_soon(self.move_head, angle)
 
     def move_head(self,angle):
         try:
-            self.robot.set_head_angle(cozmo.util.radians(angle), in_parallel=True, num_retries=0)
+            self.robot.set_head_angle(cozmo.util.radians(angle), in_parallel=True, num_retries=2)
         except cozmo.exceptions.RobotBusy:
             print("LookAtObject: robot busy; can't move head to",angle)
             pass
 
+
+class SetPose(StateNode):
+    def __init__(self, pose=Pose(0,0,0,angle_z=degrees(0))):
+        super().__init__()
+        self.pose = pose
+
+    def start(self, event=None):
+        super().start(event)
+        if isinstance(event, DataEvent) and isinstance(event.data, Pose):
+            pose = event.data
+        else:
+            pose = self.pose
+        self.robot.world.particle_filter.set_pose(self.pose.x, self.pose.y, self.pose.angle_z.radians)
+
+
 class Print(StateNode):
     "Argument can be a string, or a function to be evaluated at print time."
-    def __init__(self,spec=""):
+    def __init__(self,spec=None):
         super().__init__()
         self.spec = spec
 
@@ -325,6 +387,8 @@ class Print(StateNode):
             text = self.spec()
         else:
             text = self.spec
+        if text is None and isinstance(event, DataEvent):
+            text = repr(event.data)
         print(text)
         self.post_completion()
 
@@ -335,6 +399,99 @@ class AbortAllActions(StateNode):
         self.robot.abort_all_actions()
         self.post_completion()
 
+
+class AbortHeadAction(StateNode):
+    def start(self,event=None):
+        super().start(event)
+        actionType = cozmo._clad._clad_to_engine_cozmo.RobotActionType.UNKNOWN
+        msg = cozmo._clad._clad_to_engine_iface.CancelAction(actionType=actionType)
+        self.robot.conn.send_msg(msg)
+        self.post_completion()
+
+
+class StopAllMotors(StateNode):
+    def start(self,event=None):
+        super().start(event)
+        self.robot.stop_all_motors()
+        self.post_completion()
+
+
+#________________ Color Images ________________
+
+class ColorImageBase(StateNode):
+
+    def is_color(self,image):
+        raw = image.raw_image
+        for i in range(0, raw.height, 15):
+            pixel = raw.getpixel((i,i))
+            if pixel[0] != pixel[1]:
+                return True
+        return False
+
+
+class ColorImageEnabled(ColorImageBase):
+    """Turn color images on or off and post completion when setting has taken effect."""
+    def __init__(self,enabled=True):
+        self.enabled = enabled
+        super().__init__()
+
+    def start(self,event=None):
+        super().start(event)
+        if self.robot.camera.color_image_enabled == self.enabled:
+            self.post_completion()
+        else:
+            self.robot.camera.color_image_enabled = self.enabled
+            self.robot.world.add_event_handler(cozmo.world.EvtNewCameraImage, self.new_image)
+
+    def new_image(self,event,**kwargs):
+        is_color = self.is_color(event.image)
+        if is_color:
+            self.robot.world.latest_color_image = event.image
+        if is_color == self.enabled:
+            self.robot.world.remove_event_handler(cozmo.world.EvtNewCameraImage, self.new_image)
+            self.post_completion()
+
+
+class GetColorImage(ColorImageBase):
+    """Post one color image as a data event; leave color mode unchanged."""
+
+    def start(self,event=None):
+        super().start(event)
+        self.save_enabled = self.robot.camera.color_image_enabled
+        if not self.save_enabled:
+            self.robot.camera.color_image_enabled = True
+        self.robot.world.add_event_handler(cozmo.world.EvtNewCameraImage, self.new_image)
+
+    def new_image(self,event,**kwargs):
+        if self.is_color(event.image):
+            self.robot.world.latest_color_image = event.image
+            self.robot.world.remove_event_handler(cozmo.world.EvtNewCameraImage, self.new_image)
+            self.robot.camera.color_image_enabled = self.save_enabled
+            self.post_data(event.image)
+
+class SaveImage(StateNode):
+    "Save an image to a file."
+
+    def __init__(self, filename="image", filetype="jpg", counter=0, verbose=True):
+        super().__init__()
+        self.filename = filename
+        self.filetype = filetype
+        self.counter = counter
+        self.verbose = verbose
+
+    def start(self,event=None):
+        super().start(event)
+        fname = self.filename
+        if isinstance(self.counter, int):
+            fname = fname + str(self.counter)
+            self.counter = self.counter + 1
+        fname = fname + "." + self.filetype
+        image = np.array(self.robot.world.latest_image.raw_image)
+        cv2.imwrite(fname, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+        if self.verbose:
+            print('Wrote',fname)
+
+
 #________________ Coroutine Nodes ________________
 
 class CoroutineNode(StateNode):
@@ -342,7 +499,7 @@ class CoroutineNode(StateNode):
         super().__init__()
         self.handle = None
 
-    def start(self,event=None):
+    def start(self, event=None):
         super().start(event)
         cor = self.coroutine_launcher()
         if inspect.iscoroutine(cor):
@@ -356,7 +513,18 @@ class CoroutineNode(StateNode):
 
     def coroutine_launcher(self):
         raise Exception('%s lacks a coroutine_launcher() method' % self)
-    
+
+    def post_when_complete(self):
+        "Call this from within start() if the coroutine will signal completion."
+        self.robot.loop.create_task(self.wait_for_completion())
+
+    async def wait_for_completion(self):
+        await self.handle
+        if TRACE.trace_level >= TRACE.await_satisfied:
+            print('TRACE%d:' % TRACE.await_satisfied, self,
+                  'await satisfied:', self.handle)
+        self.post_completion()
+
     def stop(self):
         if not self.running: return
         if self.handle: self.handle.cancel()
@@ -392,7 +560,7 @@ class DriveWheels(CoroutineNode):
     def stop(self):
         if not self.running: return
         self.stop_wheels()
-        super().stop()        
+        super().stop()
 
 
 class DriveForward(DriveWheels):
@@ -511,7 +679,7 @@ class DriveArc(DriveWheels):
     containing any of the arguments accepted by __init__: radius,
     angle, distance, speed, and angspeed.  Values must already be in
     the appropriate units (degrees, mm, deg/sec, or mm/sec)."""
-    def __init__(self, radius=0, angle=0, distance=None,
+    def __init__(self, radius=0, angle=None, distance=None,
                  speed=None, angspeed=None, **kwargs):
         if isinstance(radius, cozmo.util.Distance):
             radius = radius.distance_mm
@@ -595,6 +763,23 @@ class DriveArc(DriveWheels):
             self.post_completion()
 
 
+#________________ Cube Disconnect/Reconnect ________________
+
+class DisconnectFromCubes(StateNode):
+    def start(self, event=None):
+        super().start(event)
+        self.robot.world.disconnect_from_cubes()
+
+
+class ConnectToCubes(CoroutineNode):
+    def start(self, event=None):
+        super().start(event)
+        self.post_when_complete()
+
+    def coroutine_launcher(self):
+        return self.robot.world.connect_to_cubes()
+
+
 #________________ Action Nodes ________________
 
 class ActionNode(StateNode):
@@ -626,6 +811,8 @@ class ActionNode(StateNode):
             return
         if isinstance(result, cozmo.action.Action):
             self.cozmo_action_handle = result
+        elif result is None: # Aborted
+            return
         else:
             raise ValueError("Result of %s launch_action() is %s, not a cozmo.action.Action." %
                              (self,result))
@@ -633,7 +820,7 @@ class ActionNode(StateNode):
 
     def action_launcher(self):
         raise Exception('%s lacks an action_launcher() method' % self)
-    
+
     def post_when_complete(self):
        self.robot.loop.create_task(self.wait_for_completion())
 
@@ -652,16 +839,18 @@ class ActionNode(StateNode):
                 self.post_completion()
             elif self.cozmo_action_handle.failure_reason[0] == 'retry':
                 if self.retry_count < self.action_kwargs['num_retries']:
-                    print("*** ACTION %s FAILED WITH CODE 'retry': TRYING AGAIN" %
-                        self.cozmo_action_handle)
+                    print("*** ACTION %s of %s FAILED WITH CODE 'retry': TRYING AGAIN" %
+                          (self.cozmo_action_handle, self.name))
                     self.retry_count += 1
                     self.launch_or_retry()
                 else:
-                    print("*** RETRY COUNT EXCEEDED: FAILING")
+                    print("*** %s ACTION RETRY COUNT EXCEEDED: FAILING" % self.name)
                     self.post_failure(self.cozmo_action_handle)
             else:
-                print("*** ACTION %s FAILED AND CAN'T BE RETRIED." %
-                      self.cozmo_action_handle)
+                print("*** ACTION %s OF NODE %s FAILED DUE TO %s AND CAN'T BE RETRIED." %
+                      (self.cozmo_action_handle,
+                       self.name,
+                       self.cozmo_action_handle.failure_reason[0] or 'unknown reason'))
                 self.post_failure(self.cozmo_action_handle)
 
     def stop(self):
@@ -678,7 +867,7 @@ class Say(ActionNode):
     class SayDataEvent(Event):
         def __init__(self,text=None):
             self.text = text
-            
+
     def __init__(self, text="I'm speechless",
                  abort_on_stop=False, **action_kwargs):
         self.text = text
@@ -739,6 +928,8 @@ class Turn(ActionNode):
     def __init__(self, angle=degrees(90), abort_on_stop=True, **action_kwargs):
         if isinstance(angle, (int,float)):
             angle = degrees(angle)
+        elif angle is None:
+            pass
         elif not isinstance(angle, cozmo.util.Angle):
             raise ValueError('%s angle must be a number or a cozmo.util.Angle' % self)
         self.angle = angle
@@ -752,9 +943,13 @@ class Turn(ActionNode):
         super().start(event)
 
     def action_launcher(self):
-        return self.robot.turn_in_place(self.angle, **self.action_kwargs)
+        if self.angle is None:
+            return None
+        else:
+            return self.robot.turn_in_place(self.angle, **self.action_kwargs)
 
 class GoToPose(ActionNode):
+    "Uses SDK's go_to_pose method."
     def __init__(self, pose, abort_on_stop=True, **action_kwargs):
         self.pose = pose
         self.action_kwargs = action_kwargs
@@ -773,11 +968,18 @@ class SetHeadAngle(ActionNode):
         self.action_kwargs = action_kwargs
         super().__init__(abort_on_stop)
 
+    def start(self,event=None):
+        if self.running: return
+        if isinstance(event, DataEvent) and isinstance(event.data, cozmo.util.Angle):
+            self.angle = event.data
+        super().start(event)
+
     def action_launcher(self):
         return self.robot.set_head_angle(self.angle, **self.action_kwargs)
 
 class SetLiftHeight(ActionNode):
     def __init__(self, height=0, abort_on_stop=True, **action_kwargs):
+        """height is a percentage from 0 to 1"""
         self.height = height
         self.action_kwargs = action_kwargs
         super().__init__(abort_on_stop)
@@ -790,18 +992,48 @@ class SetLiftHeight(ActionNode):
 
 class SetLiftAngle(SetLiftHeight):
     def __init__(self, angle, abort_on_stop=True, **action_kwargs):
-        def get_theta(height):
-            return math.asin((height-45)/66)
+
+        #def get_theta(height):
+        #   return math.asin((height-45)/66)
+
         if isinstance(angle, cozmo.util.Angle):
-            angle = angle.radians
-        min_theta = get_theta(cozmo.robot.MIN_LIFT_HEIGHT_MM)
-        max_theta = get_theta(cozmo.robot.MAX_LIFT_HEIGHT_MM)
+            angle = angle.degrees
+        self.angle = angle
+        super().__init__(0, abort_on_stop=abort_on_stop, **action_kwargs)
+
+    def start(self,event=None):
+        if self.running: return
+        if isinstance(event, DataEvent) and isinstance(event.data, cozmo.util.Angle):
+            self.angle = event.data.degrees
+        min_theta = cozmo.robot.MIN_LIFT_ANGLE.degrees
+        max_theta = cozmo.robot.MAX_LIFT_ANGLE.degrees
         angle_range = max_theta - min_theta
-        height_pct = (angle - min_theta) / angle_range
-        super().__init__(height_pct, abort_on_stop=abort_on_stop, **action_kwargs)
+        self.height = (self.angle - min_theta) / angle_range
+        super().start(event)
+
+
+class DockWithCube(ActionNode):
+    "Uses SDK's dock_with_cube method."
+    def __init__(self, object=None, abort_on_stop=False, **action_kwargs):
+        self.object = object
+        self.action_kwargs = action_kwargs
+        super().__init__(abort_on_stop=abort_on_stop)
+
+    def start(self,event=None):
+        if self.running: return
+        if isinstance(event, DataEvent) and \
+                isinstance(event.data,cozmo.objects.LightCube):
+            self.object = event.data
+        super().start(event)
+
+    def action_launcher(self):
+        if self.object is None:
+            raise ValueError('No cube to dock with')
+        return self.robot.dock_with_cube(self.object, **self.action_kwargs)
 
 
 class PickUpObject(ActionNode):
+    "Uses SDK's pick_up_object method."
     def __init__(self, object=None, abort_on_stop=False, **action_kwargs):
         self.object = object
         self.action_kwargs = action_kwargs
@@ -819,7 +1051,9 @@ class PickUpObject(ActionNode):
             raise ValueError('No object to pick up')
         return self.robot.pickup_object(self.object, **self.action_kwargs)
 
+
 class PlaceObjectOnGroundHere(ActionNode):
+    "Uses SDK's place_object_on_ground_here method."
     def __init__(self, object=None, abort_on_stop=False, **action_kwargs):
         self.object = object
         self.action_kwargs = action_kwargs
@@ -838,6 +1072,7 @@ class PlaceObjectOnGroundHere(ActionNode):
         return self.robot.place_object_on_ground_here(self.object, **self.action_kwargs)
 
 class PlaceOnObject(ActionNode):
+    "Uses SDK's place_on_object method."
     def __init__(self, object=None, abort_on_stop=False, **action_kwargs):
         self.object = object
         self.action_kwargs = action_kwargs
@@ -855,7 +1090,7 @@ class PlaceOnObject(ActionNode):
             raise ValueError('No object to place')
         return self.robot.place_on_object(self.object, **self.action_kwargs)
 
-
+# Note: additional nodes for object manipulation are in pickup.fsm.
 
 #________________ Animations ________________
 
@@ -897,7 +1132,7 @@ class StartBehavior(StateNode):
             return '<%s %s active=%s>' % \
                    (self.__class__.__name__, self.name, self.behavior_handle.is_active)
         else:
-            return super().__repr__()        
+            return super().__repr__()
 
     def start(self,event=None):
         if self.running: return
@@ -921,7 +1156,7 @@ class StartBehavior(StateNode):
 
 class StopBehavior(StateNode):
     def start(self,event=None):
-        if self. running: return
+        if self.running: return
         super().start(event)
         try:
             if self.robot.behavior_handle:
@@ -953,3 +1188,53 @@ class RollBlock(StartBehavior):
 class StackBlocks(StartBehavior):
     def __init__(self,stop_on_exit=True):
         super().__init__(cozmo.robot.behavior.BehaviorTypes.StackBlocks,stop_on_exit)
+
+#________________ Multiprocessing ________________
+
+class LaunchProcess(StateNode):
+
+    def __init__(self):
+        super().__init__()
+        self.process = None
+
+    @staticmethod
+    def process_workhorse(reply_token):
+        """
+        Override this static method with the code to do your computation.
+        The method must be static because we can't pickle methods of StateNode
+        instances.
+        """
+        print('*** Failed to override process_workhorse for LaunchProcess node ***')
+        print('Sleeping for 2 seconds...')
+        time.sleep(2)
+        # A process returns its result to the caller as an event.
+        result = 42
+
+        LaunchProcess.post_event(reply_token,DataEvent(None,result))  # source must be None for pickling
+        LaunchProcess.post_event(reply_token,CompletionEvent()) # we can post more than one event
+
+    @staticmethod
+    def post_event(reply_token,event):
+        id,queue = reply_token
+        event_pair = (id, event)
+        queue.put(event_pair)
+
+    def create_process(self):
+        reply_token = (id(self), self.robot.erouter.interprocess_queue)
+        p = Process(target=self.__class__.process_workhorse,
+                    args=[reply_token])
+        return p
+
+    def start(self, event=None):
+        super().start(event)
+        self.process = self.create_process()
+        self.robot.erouter.add_process_node(self)
+        self.process.start()
+        print('Launched', self.process)
+
+    def stop(self):
+        self.robot.erouter.delete_process_node(self)
+        self.process.terminate()
+        self.process = None
+        super().stop()
+

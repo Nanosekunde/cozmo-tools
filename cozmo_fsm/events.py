@@ -1,5 +1,5 @@
 """
-    The base Event class is imported from erouter.py.
+    The base Event class is imported from evbase.py.
     All other events are defined here.
 """
 
@@ -11,11 +11,13 @@ class CompletionEvent(Event):
     """Signals completion of a state node's action."""
     pass
 
+
 class SuccessEvent(Event):
     """Signals success of a state node's action."""
     def __init__(self,source,details):
         super().__init__(source)
         self.details = details
+
 
 class FailureEvent(Event):
     """Signals failure of a state node's action."""
@@ -71,7 +73,7 @@ class CozmoGeneratedEvent(Event):
         self.params = params
     # Note regarding generator(): we're going to curry this function
     # to supply EROUTER and EVENT_CLASS as the first two arguments.
-    def generator(EROUTER, EVENT_CLASS, cozmo_event, obj, **kwargs):
+    def generator(EROUTER, EVENT_CLASS, cozmo_event, obj=None, **kwargs):
         our_event = EVENT_CLASS(obj,kwargs)
         EROUTER.post(our_event)
 
@@ -80,3 +82,43 @@ class TapEvent(CozmoGeneratedEvent):
 
 class FaceEvent(CozmoGeneratedEvent):
     cozmo_evt_type = cozmo.faces.EvtFaceAppeared
+
+class ObservedMotionEvent(CozmoGeneratedEvent):
+    cozmo_evt_type = cozmo.camera.EvtRobotObservedMotion
+
+    def __repr__(self):
+        top = self.params['has_top_movement']
+        left = self.params['has_left_movement']
+        right = self.params['has_right_movement']
+        movement = ''
+        if top:
+            pos = self.params['top_img_pos']
+            movement = movement + ('' if (movement=='') else ' ') + \
+                       ('top:(%d,%d)' % (pos.x,pos.y))
+        if left:
+            pos = self.params['left_img_pos']
+            movement = movement + ('' if (movement=='') else ' ') + \
+                       ('left:(%d,%d)' % (pos.x,pos.y))
+        if right:
+            pos = self.params['right_img_pos']
+            movement = movement + ('' if (movement=='') else ' ') + \
+                       ('right:(%d,%d)' % (pos.x,pos.y))
+        if movement == '':
+            pos = self.params['img_pos']
+            movement = movement + ('' if (movement=='') else ' ') + \
+                       ('broad:(%d,%d)' % (pos.x,pos.y))
+        return '<%s %s>' % (self.__class__.__name__, movement)
+
+
+class UnexpectedMovementEvent(CozmoGeneratedEvent):
+    cozmo_evt_type = cozmo.robot.EvtUnexpectedMovement
+
+    def __repr__(self):
+        side = self.params['movement_side']
+        # side.id == 0 means the movement_side is "unknown"
+        # Occurs when reaction triggers are disabled (as is normally the case).
+        side_string = ' '+side.name if side.id > 0 else ''
+        return '<%s %s%s>' % (self.__class__.__name__,
+                              self.params['movement_type'].name,
+                              side_string)
+

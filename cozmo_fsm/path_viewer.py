@@ -13,10 +13,12 @@ import time
 from math import pi, sin, cos
 import array
 import numpy as np
+import platform
 
 WINDOW = None
 
 from . import opengl
+from .rrt import RRTNode
 from .rrt_shapes import *
 from . import transform
 from .transform import wrap_angle
@@ -24,14 +26,42 @@ from .transform import wrap_angle
 the_rrt = None
 the_items = []  # each item is a tuple (tree,color)
 
+help_text = """
+Path viewer commands:
+  arrows   Translate the view up/down/left/right
+  Home     Center the view (zero translation)
+  <        Zoom in
+  >        Zoom out
+  o        Show objects
+  b        Show obstacles
+  p        Show pose
+  space    Toggle redisplay (for debugging)
+  h        Print this help text
+"""
+
+help_text_mac = """
+Path viewer commands:
+  arrows           Translate the view up/down/left/right
+  fn + left-arrow  Center the view (zero translation)
+  option + <       Zoom in
+  option + >       Zoom out
+  option + o       Show objects
+  option + b       Show obstacles
+  option + p       Show pose
+  space            Toggle redisplay (for debugging)
+  option + h       Print this help text
+"""
+
+
 class PathViewer():
-    def __init__(self, rrt,
+    def __init__(self, robot, rrt,
                  width=512, height=512,
                  windowName = "path viewer",
                  bgcolor = (0,0,0)):
         global the_rrt, the_items
         the_rrt = rrt
         the_items = []
+        self.robot = robot
         self.width = width
         self.height = height
         self.bgcolor = bgcolor
@@ -42,7 +72,7 @@ class PathViewer():
 
     def window_creator(self):
         global WINDOW
-        WINDOW = opengl.create_window(self.windowName, (self.width,self.height))        
+        WINDOW = opengl.create_window(bytes(self.windowName,'utf-8'), (self.width,self.height))
         glutDisplayFunc(self.display)
         glutReshapeFunc(self.reshape)
         glutKeyboardFunc(self.keyPressed)
@@ -59,7 +89,10 @@ class PathViewer():
             opengl.CREATION_QUEUE.append(self.window_creator)
             while not WINDOW:
                 time.sleep(0.1)
-        print("Type 'h' in the path viewer window for help.")
+        if platform.system() == 'Darwin':
+            print("Type 'option' + 'h' in the path viewer window for help.")
+        else:
+            print("Type 'h' in the path viewer window for help.")
 
     def clear(self):
         global the_items
@@ -111,7 +144,7 @@ class PathViewer():
             theta = angle/180*pi
             glVertex2f(center[0]+radius*cos(theta), center[1]+radius*sin(theta))
         glEnd()
-        
+
 
     def draw_triangle(self,center,scale=1,angle=0,color=(1,1,1),fill=True):
         # Default to solid color
@@ -172,8 +205,8 @@ class PathViewer():
                     self.draw_line((init_x,init_y), (cur_x,cur_y), color=color)
                     (init_x,init_y) = (cur_x,cur_y)
 
-    def draw_robot(self,start_node):
-        parts = the_rrt.robot_parts_to_node(start_node)
+    def draw_robot(self,node):
+        parts = the_rrt.robot_parts_to_node(node)
         for part in parts:
             if isinstance(part,Circle):
                 self.draw_circle(center=(part.center[0,0],part.center[1,0]),
@@ -192,11 +225,15 @@ class PathViewer():
                              radius=obst.radius,
                              color=(1,0,0,0.5), fill=True)
         elif isinstance(obst,Rectangle):
-            self.draw_rectangle(center = (obst.center[0], obst.center[1]),
-                                angle = obst.orient*(180/pi),
-                                width = obst.max_Ex - obst.min_Ex,
-                                height = obst.max_Ey - obst.min_Ey,
-                                color=(1,0,0,0.5), fill=True)
+            width = obst.max_Ex - obst.min_Ex
+            height = obst.max_Ey - obst.min_Ey
+            if width <= 10*height:
+                color = (1, 0, 0, 0.5)
+            else:
+                color = (1, 1, 0, 0.5)
+            self.draw_rectangle(center=(obst.center[0], obst.center[1]),
+                                angle=obst.orient*(180/pi),
+                                width=width, height=height, color=color, fill=True)
 
     def add_tree(self, tree, color):
         global the_items
@@ -226,8 +263,10 @@ class PathViewer():
         for obst in the_rrt.obstacles:
             self.draw_obstacle(obst)
 
-        if the_rrt.start:
-            self.draw_robot(the_rrt.start)
+        #if the_rrt.start:
+        #    self.draw_robot(the_rrt.start)
+        pose = self.robot.world.particle_filter.pose
+        self.draw_robot(RRTNode(x=pose[0], y=pose[1], q=pose[2]))
 
         glutSwapBuffers()
 
@@ -240,13 +279,23 @@ class PathViewer():
         glutPostRedisplay()
 
     def keyPressed(self,key,mouseX,mouseY):
-        if key == b'+':     # zoom in
+        # print(str(key), ord(key))
+        if key == b'<':       # zoom in
             self.scale *= 1.25
             self.print_display_params()
             return
-        elif key == b'-':     # zoom out
+        elif key == b'>':     # zoom out
             self.scale /= 1.25
             self.print_display_params()
+            return
+        elif key == b'o':     # show objects
+            self.robot.world.world_map.show_objects()
+            return
+        elif key == b'b':     # show obstacles
+            self.show_obstacles()
+            return
+        elif key == b'p':     # show pose
+            self.robot.world.world_map.show_pose()
             return
         elif key == b'h':     # print help
             self.print_help()
@@ -272,13 +321,14 @@ class PathViewer():
         print('scale=%.2f translation=[%.1f, %.1f]' %
               (self.scale, *self.translation))
 
+    def show_obstacles(self):
+        print('RRT has %d obstacles.' % len(the_rrt.obstacles))
+        for obstacle in the_rrt.obstacles:
+            print('  ', obstacle)
+        print()
+
     def print_help(self):
-        print("""
-Path viewer commands:
-  arrows     Translate the view up/down/left/right
-   Home      Center the view (zero translation)
-    +        Zoom in
-    -        Zoom out
-  space      Toggle redisplay (for debugging)
-    h        Print this help text
-""")
+        if platform.system() == 'Darwin':
+            print(help_text_mac)
+        else:
+            print(help_text)

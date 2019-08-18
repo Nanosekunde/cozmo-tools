@@ -1,18 +1,25 @@
 import cv2, math
 from numpy import sqrt, arctan2, array, multiply
 
+ARUCO_MARKER_SIZE = 44
+
 class ArucoMarker(object):
-    def __init__(self,marker_id,bbox,translation,rotation):
+    def __init__(self, aruco_parent, marker_id, bbox, translation, rotation):
         self.id = marker_id
+        self.id_string = 'Aruco-' + str(marker_id)
         self.bbox = bbox
+        self.aruco_parent = aruco_parent
 
         # OpenCV Pose information
         self.opencv_translation = translation
         self.opencv_rotation = (180/math.pi)*rotation
 
-        # Cozmo coordinates in camera reference frame
+        # Marker coordinates in robot's camera reference frame
         self.camera_coords = (-translation[0], -translation[1], translation[2])
+
+        # Distance in the x-y plane; particle filter ignores height so don't include it
         self.camera_distance = math.sqrt(translation[0]*translation[0] +
+                                         # translation[1]*translation[1] +
                                          translation[2]*translation[2])
         # Conversion to euler angles
         self.euler_rotation = self.rotationMatrixToEulerAngles(
@@ -25,14 +32,15 @@ class ArucoMarker(object):
     def __repr__(self):
         return self.__str__()
 
-    def rotationMatrixToEulerAngles(self,R) :
+    @staticmethod
+    def rotationMatrixToEulerAngles(R) :
         sy = sqrt(R[0,0] * R[0,0] +  R[1,0] * R[1,0])
         singular = sy < 1e-6
-        if  not singular :
+        if  not singular:
             x = arctan2(R[2,1] , R[2,2])
             y = arctan2(-R[2,0], sy)
             z = arctan2(R[1,0], R[0,0])
-        else :
+        else:
             x = arctan2(-R[1,2], R[1,1])
             y = arctan2(-R[2,0], sy)
             z = 0
@@ -40,16 +48,19 @@ class ArucoMarker(object):
         return array([x, y, z])
 
 class Aruco(object):
-    def __init__(self, robot, arucolibname, marker_size=50):
+    def __init__(self, robot, arucolibname, marker_size=ARUCO_MARKER_SIZE, disabled_ids=[]):
         self.arucolibname = arucolibname
         self.aruco_lib = cv2.aruco.Dictionary_get(arucolibname)
         self.aruco_params = cv2.aruco.DetectorParameters_create()
         self.seen_marker_ids = []
         self.seen_marker_objects = dict()
+        self.disabled_ids = disabled_ids  # disable markers with high false detection rates
         self.ids = []
         self.corners = []
 
-        #added for pose estimation
+        if robot.camera is None: return  # robot is a SimRobot
+
+        # Added for pose estimation
         self.marker_size = marker_size #these units will be pose est units!!
         self.image_size = (320,240)
         focal_len = robot.camera._config._focal_length
@@ -77,7 +88,16 @@ class Aruco(object):
         self.rvecs = estimate[0]
         self.tvecs = estimate[1]
         for i in range(len(self.ids)):
-            marker = ArucoMarker(self.ids[i][0], self.corners[i],self.tvecs[i][0],self.rvecs[i][0])
+            id = int(self.ids[i][0])
+            if id in self.disabled_ids: continue
+            tvec = self.tvecs[i][0]
+            rvec = self.rvecs[i][0]
+            if rvec[2] > math.pi/2 or rvec[2] < -math.pi/2:
+                # can't see a marker facing away from us, so bogus
+                print('Marker rejected! id=', id, 'tvec=', tvec, 'rvec=', rvec)
+                continue
+            marker = ArucoMarker(self, id,
+                                 self.corners[i], self.tvecs[i][0], self.rvecs[i][0])
             self.seen_marker_ids.append(marker.id)
             self.seen_marker_objects[marker.id] = marker
 
@@ -85,7 +105,7 @@ class Aruco(object):
         scaled_corners = [ multiply(corner, scale_factor) for corner in self.corners ]
         displayim = cv2.aruco.drawDetectedMarkers(image, scaled_corners, self.ids)
 
-        #add poses #currently fails since image is already scaled. How to scale camMat?
+        #add poses currently fails since image is already scaled. How to scale camMat?
         #if(self.ids is not None):
         #    for i in range(len(self.ids)):
         #      displayim = cv2.aruco.drawAxis(displayim,self.cameraMatrix,
